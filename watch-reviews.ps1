@@ -12,6 +12,12 @@ Write-Host "======================================" -ForegroundColor Cyan
 Write-Host "  Code Review Watcher" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
+
+if ([string]::IsNullOrWhiteSpace($GitLabToken)) {
+    Write-Host "[ERROR] GitLabToken is not set in config.ps1. Exiting." -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "Watching: $queueFile" -ForegroundColor Gray
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Gray
 Write-Host ""
@@ -33,7 +39,7 @@ function Parse-MRUrl {
 function Get-MRDetails {
     param($parsed)
     
-    $headers = @{ "PRIVATE-TOKEN" = $GitLabToken }
+    $headers = Get-AuthHeaders
     $baseUrl = "https://$($parsed.Host)/api/v4"
     
     $mrUrl = "$baseUrl/projects/$($parsed.ProjectEncoded)/merge_requests/$($parsed.MrIid)"
@@ -285,13 +291,27 @@ function Review-CodeChanges {
     return $issues
 }
 
+function Get-AuthHeaders {
+    return @{
+        "PRIVATE-TOKEN" = $GitLabToken
+        "Content-Type"  = "application/json; charset=utf-8"
+    }
+}
+
+function Get-IssueCounts {
+    param($issues)
+    return @{
+        Critical = ($issues | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+        Warning  = ($issues | Where-Object { $_.Severity -eq "WARNING" }).Count
+        Info     = ($issues | Where-Object { $_.Severity -eq "INFO" }).Count
+        Minor    = ($issues | Where-Object { $_.Severity -eq "MINOR" }).Count
+    }
+}
+
 function Post-MRComment {
     param($details, [string]$body)
-    
-    $headers = @{ 
-        "PRIVATE-TOKEN" = $GitLabToken
-        "Content-Type" = "application/json"
-    }
+
+    $headers = Get-AuthHeaders
     
     $noteUrl = "$($details.BaseUrl)/projects/$($details.ProjectEncoded)/merge_requests/$($details.MrIid)/notes"
     $payload = @{ body = $body } | ConvertTo-Json -Depth 10
@@ -301,11 +321,8 @@ function Post-MRComment {
 
 function Post-LineComment {
     param($details, $issue, $changes)
-    
-    $headers = @{ 
-        "PRIVATE-TOKEN" = $GitLabToken
-        "Content-Type" = "application/json"
-    }
+
+    $headers = Get-AuthHeaders
     
     $change = $changes | Where-Object { $_.new_path -eq $issue.File -or $_.old_path -eq $issue.File } | Select-Object -First 1
     
@@ -323,6 +340,11 @@ function Post-LineComment {
         default { "[NOTE]" }
     }
     
+    if (-not $details.MR.diff_refs) {
+        Write-Host "    [!] No diff_refs on MR (draft or diff not computed) — skipping inline comment" -ForegroundColor DarkYellow
+        return $false
+    }
+
     $payload = @{
         body = "$severityIcon $($issue.Message)"
         position = @{
@@ -347,11 +369,8 @@ function Post-LineComment {
 
 function Merge-MR {
     param($details)
-    
-    $headers = @{ 
-        "PRIVATE-TOKEN" = $GitLabToken
-        "Content-Type" = "application/json"
-    }
+
+    $headers = Get-AuthHeaders
     
     $mergeUrl = "$($details.BaseUrl)/projects/$($details.ProjectEncoded)/merge_requests/$($details.MrIid)/merge"
     
@@ -360,6 +379,7 @@ function Merge-MR {
         return $true
     }
     catch {
+        Write-Host "  [!] Merge failed: $($_.Exception.Message)" -ForegroundColor DarkYellow
         return $false
     }
 }
@@ -428,20 +448,17 @@ function Process-MR {
         $summaryLines += "No issues found - code looks good!"
     }
     else {
-        $critical = ($issues | Where-Object { $_.Severity -eq "CRITICAL" }).Count
-        $warning = ($issues | Where-Object { $_.Severity -eq "WARNING" }).Count
-        $info = ($issues | Where-Object { $_.Severity -eq "INFO" }).Count
-        $minor = ($issues | Where-Object { $_.Severity -eq "MINOR" }).Count
-        
+        $counts = Get-IssueCounts $issues
+
         $summaryLines += "### Issues Found"
         $summaryLines += ""
         $summaryLines += "| Severity | Count |"
         $summaryLines += "|----------|-------|"
-        if ($critical -gt 0) { $summaryLines += "| CRITICAL | $critical |" }
-        if ($warning -gt 0) { $summaryLines += "| WARNING | $warning |" }
-        if ($info -gt 0) { $summaryLines += "| INFO | $info |" }
-        if ($minor -gt 0) { $summaryLines += "| MINOR | $minor |" }
-        
+        if ($counts.Critical -gt 0) { $summaryLines += "| CRITICAL | $($counts.Critical) |" }
+        if ($counts.Warning  -gt 0) { $summaryLines += "| WARNING  | $($counts.Warning) |" }
+        if ($counts.Info     -gt 0) { $summaryLines += "| INFO     | $($counts.Info) |" }
+        if ($counts.Minor    -gt 0) { $summaryLines += "| MINOR    | $($counts.Minor) |" }
+
         if ($failedComments.Count -gt 0) {
             $summaryLines += ""
             $summaryLines += "### Additional Notes (could not post inline)"
@@ -457,7 +474,7 @@ function Process-MR {
         $summaryLines += "**Status:** Approved for merge"
     }
     else {
-        $summaryLines += "**Status:** Changes requested - please fix critical issues"
+        $summaryLines += "**Status:** Changes requested - please fix WARNING or above issues before merging"
     }
     
     $summaryComment = $summaryLines -join "`n"
@@ -487,15 +504,12 @@ function Process-MR {
         "no issues"
     }
     else {
+        $counts = Get-IssueCounts $issues
         $parts = @()
-        $critical = ($issues | Where-Object { $_.Severity -eq "CRITICAL" }).Count
-        $warning = ($issues | Where-Object { $_.Severity -eq "WARNING" }).Count
-        $info = ($issues | Where-Object { $_.Severity -eq "INFO" }).Count
-        $minor = ($issues | Where-Object { $_.Severity -eq "MINOR" }).Count
-        if ($critical -gt 0) { $parts += "$critical critical" }
-        if ($warning -gt 0) { $parts += "$warning warnings" }
-        if ($info -gt 0) { $parts += "$info info" }
-        if ($minor -gt 0) { $parts += "$minor minor" }
+        if ($counts.Critical -gt 0) { $parts += "$($counts.Critical) critical" }
+        if ($counts.Warning  -gt 0) { $parts += "$($counts.Warning) warnings" }
+        if ($counts.Info     -gt 0) { $parts += "$($counts.Info) info" }
+        if ($counts.Minor    -gt 0) { $parts += "$($counts.Minor) minor" }
         $parts -join ", "
     }
     
