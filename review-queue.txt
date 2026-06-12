@@ -1,0 +1,7 @@
+# Code Review Queue
+# -----------------
+# Paste GitLab MR links below (one per line).
+#
+# Lines starting with # are ignored.
+# Processed links will be moved to review-done.txt
+
