@@ -42,6 +42,10 @@ function Get-MRDetails {
     $changesUrl = "$mrUrl/changes"
     $changes = Invoke-RestMethod -Uri $changesUrl -Headers $headers
     
+    if ($changes.overflow_changes) {
+        Write-Host "  [!] Warning: MR has too many changed files — some files were not returned by GitLab and will not be reviewed." -ForegroundColor Yellow
+    }
+
     return @{
         MR = $mr
         Changes = $changes.changes
@@ -90,8 +94,13 @@ function Review-CodeChanges {
                 }
                 
                 # Empty catch blocks
-                if ($code -match "catch\s*\{?\s*$" -or $code -match "catch\s*\([^)]*\)\s*\{?\s*$") {
-                    # Check if next lines are empty
+                if ($code -match "catch\s*\(\s*\w[^)]*\)\s*\{\s*$" -or $code -match "catch\s*\{\s*$") {
+                    $issues += @{
+                        Severity = "WARNING"
+                        File = $file
+                        Line = $currentLine
+                        Message = "Potentially empty catch block detected. Ensure exceptions are handled or at least logged."
+                    }
                 }
                 
                 # Hardcoded GUIDs
@@ -156,7 +165,12 @@ function Review-CodeChanges {
                 
                 # Duplicate using statements (check for System.* without using at start)
                 if ($code -match "^using System;" -and $file -match "\.cs$") {
-                    # Check if specific usings are also present
+                    $issues += @{
+                        Severity = "INFO"
+                        File = $file
+                        Line = $currentLine
+                        Message = "Redundant 'using System;' may be present alongside more specific System.* usings. Review and remove duplicates."
+                    }
                 }
                 
                 # Missing async suffix
@@ -173,8 +187,13 @@ function Review-CodeChanges {
                 }
                 
                 # Potential null reference
-                if ($code -match "\.ToString\(\)" -and $code -notmatch "\?" -and $code -notmatch "!\.") {
-                    # Could be null
+                if ($code -match "\.ToString\(\)" -and $code -notmatch "\?" -and $code -notmatch "!\." -and $code -notmatch "nameof\(") {
+                    $issues += @{
+                        Severity = "INFO"
+                        File = $file
+                        Line = $currentLine
+                        Message = "Calling .ToString() without null check. Consider using ?.ToString() or null-conditional access to avoid NullReferenceException."
+                    }
                 }
                 
                 # Long lines
@@ -377,10 +396,10 @@ function Process-MR {
     Write-Host "  -> Analyzing code..." -ForegroundColor Gray
     $issues = Review-CodeChanges $details.Changes $mr
     
-    $hasCritical = ($issues | Where-Object { $_.Severity -eq "CRITICAL" }).Count -gt 0
-    $shouldMerge = -not $hasCritical
+    $hasBlocker = ($issues | Where-Object { $_.Severity -eq "CRITICAL" -or $_.Severity -eq "WARNING" }).Count -gt 0
+    $shouldMerge = -not $hasBlocker
     
-    Write-Host "  -> Found $($issues.Count) issues (Critical: $hasCritical)" -ForegroundColor Gray
+    Write-Host "  -> Found $($issues.Count) issues (Blockers: $hasBlocker)" -ForegroundColor Gray
     
     # Post line comments
     $postedCount = 0
@@ -494,7 +513,14 @@ function Process-MR {
 # Main loop
 while ($true) {
     if (Test-Path $queueFile) {
-        $lines = Get-Content $queueFile
+        try {
+            $lines = Get-Content $queueFile -ErrorAction Stop
+        }
+        catch {
+            Write-Host "$(Get-Date -Format 'HH:mm:ss') - Could not read queue file: $_" -ForegroundColor DarkYellow
+            Start-Sleep -Seconds 5
+            continue
+        }
         $newLines = @()
         
         foreach ($line in $lines) {
@@ -505,7 +531,7 @@ while ($true) {
                 continue
             }
             
-            if ($trimmed -match "merge_requests/\d+") {
+            if ($trimmed -match "https?://.+/-/merge_requests/\d+") {
                 $result = Process-MR $trimmed
                 
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm"
